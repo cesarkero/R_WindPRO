@@ -1,0 +1,218 @@
+source('f.R'); library(insol); library(rlist)
+library(raster); library(chron); library(shadow)
+library(stringr); library(lubridate); library(sp)
+library(rgdal); library(shadow); library(rgeos)
+library(dplyr); library(xlsx); library(pbapply)
+library(future)
+
+#------------------------------------------------------------------------------
+#PARAMETERS
+DEM <- raster("./layers/DEM.tif")
+shader <- readOGR("./layers/layers.gpkg", "points_buffer_100m")
+houses <- readOGR("./layers/layers.gpkg", "asentamientos")
+#this houses must have "id" --> int value and must be the order or geometries preferably
+outdir <- "./output/"
+doShadoStyle <- "./styles/doShadow_black.qml"
+ShadowMAPStyle <- "./styles/doShadow_ShadowMAP.qml"
+
+YYYY <- c(2019); MM <- c(1,6); DD <- c(1,15)
+TZ <- "Europe/Berlin"
+by <- '60 min'
+
+filterSunriseSunset <- TRUE #(NOT DONE YET)
+exportRaster <- TRUE
+
+#-------------------------------------------------------------------------------
+# MODIFIED RASTER --> DEMm
+# DEM + the shader element (in this case a wind turbine)
+shader$alt <- 180 #add alt to shader 
+#la altura del objeto puede mejorarse considerando anillos a distintas alturas
+
+rpoly <- raster(ncol = ncol(DEM), nrow = nrow(DEM))#rasterize
+extent(rpoly) <- extent(DEM)
+DEMm <- rasterize(shader, rpoly, 'alt')
+DEMm[is.na(DEMm[])] <- 0    # replacing NA's by zero
+DEMm <- DEM+DEMm #raster DEM + artifact
+
+#-------------------------------------------------------------------------------
+# GET COORDS FROM MIDPOINT FROM EXTENSION
+x <- midPoint(DEM)[[1]]
+y <- midPoint(DEM)[[2]]
+
+# calculat tSeries (from personal function)
+ts <- tSeries2(YYYY,MM,DD,by,TZ) 
+
+# TS TO JULIAN DAYS (needed for insol functions)
+tsjd <- JD(ts)
+# sp <- sunpos(sunvector(tsjd,y,x,0)) ## sun position
+
+# FILTER TIMES TO CALCULATE between min sunrise and max sunset
+if (filterSunriseSunset == TRUE){
+    # calculate daylength considering zone time (needed just for filtering)
+    tzcorr <- c()
+    for (i in 1:length(ts)) {
+        if (format(ts[i],"%Z") == 'CET') {tzcorr <- c(tzcorr, 1)} 
+        else if (format(ts[i],"%Z") == 'CEST') {tzcorr <- c(tzcorr, 2)}
+    }
+    minsunrise <- floor(min(daylength(y,x,tsjd,tzcorr)[,1]))
+    maxsunset <- ceiling(max(daylength(y,x,tsjd,tzcorr)[,2]))
+    tzcorr <- tzcorr[hour(ts)>=minsunrise & hour(ts)<=maxsunset]
+    tsjd <- tsjd[hour(ts)>=minsunrise & hour(ts)<=maxsunset]
+    ts <- ts[hour(ts)>=minsunrise & hour(ts)<=maxsunset]
+} 
+
+#-------------------------------------------------------------------------------
+# DOSHADE AND CREATE RASTER STACK FOR DEM
+# remember:doshade makes 1 as inlight and 0 inshadow, in case you wants to imitate
+# grass r.sunmask.position you have to invert values
+# r <- stack()
+# for (t in 1:length(ts)){
+#     print(ts[t])
+#     sv <- sunvector(tsjd[t],y,x,0) #sunvector
+#     sh <- doshade(DEM,sv)
+#     r <- stack(r,sh)
+# }
+
+DEMstack <- stack(pblapply(pblapply(tsjd, sunvector,y,x,0), doshade, dem=DEM))
+names(DEMstack) <- AAAAMMDD_HHmmss(ts) # rename raster stack
+gc()
+#-------------------------------------------------------------------------------
+#DOSHADE AND CREATE RASTER STACK FOR DEMm
+#remember:doshade makes 1 as inlight and 0 inshadow, in case you wants to imitate
+#grass r.sunmask.position you have to invert values
+# rm <- stack()
+# for (t in 1:length(ts)){
+#     print(ts[t])
+#     sv <- sunvector(tsjd[t],y,x,0) #sunvector
+#     sh <- doshade(DEMm,sv)
+#     rm <- stack(rm,sh)
+# }
+
+DEMmstack <- stack(pblapply(pblapply(tsjd, sunvector,y,x,0), doshade, dem=DEMm))
+names(DEMmstack) <- AAAAMMDD_HHmmss(ts) #rename raster stack
+gc()
+
+#-------------------------------------------------------------------------------
+## PARALLLEL
+## r and rm in parallel with future
+# DEMstack <- future({stack(pblapply(pblapply(tsjd, sunvector,y,x,0), doshade, dem=DEM))}) %plan% multiprocess
+# DEMmstack <- future({stack(pblapply(pblapply(tsjd, sunvector,y,x,0), doshade, dem=DEMm))}) %plan% multiprocess
+
+#-------------------------------------------------------------------------------
+# DEMmdif
+# 0 is shadow and 1 is light and it will reversed after this
+# plot(rm[[18]])
+# plot(r[[18]])
+# plot(abs(rm[[18]]-r[[18]])) #this plots the difference and revere value 
+# DEMmdif <- stack()
+# for (t in 1:length(ts)){
+#     DEMmdif <- stack(DEMmdif,abs(rm[[t]]-r[[t]])) #reversed diff
+# }
+
+DEMmdif <- stack(pblapply(1:length(ts), function(x) abs(DEMstack[[x]]-DEMmstack[[x]])))
+names(DEMmdif) <- AAAAMMDD_HHmmss(ts) #rename raster stack
+gc()
+#-------------------------------------------------------------------------------
+# DEMmdif
+# PODRIAN CALCULARSE SIMPLEMENTE LAS NUEVAS AREAS BARRIDAS POR LA SOMBRA DE LOS AEROS
+
+#-------------------------------------------------------------------------------
+# SAMPLE DEM WITH CENTROIDS
+## Make centroids
+h <- SpatialPointsDataFrame(gCentroid(houses, byid=TRUE), 
+                                      houses@data, match.ID=FALSE)
+## Sample DEMmdif
+flicker <- extract(DEMmdif, h)
+flicker[is.na(flicker)] <- 0 #remove NA by 0 to avoid problems
+
+#-------------------------------------------------------------------------------
+# CALCULATE RESULTS BY ID
+##  METHOD OF SUMMARY IN A LIST
+### 1. Iterate each row
+### 2. Create a list of colnames (date_time) where value is 1
+### 3. Get list of lists. Each list contains
+        #- The id of the house
+        #- The count of flicker hours
+        #- The list of date_times where flicker occurs
+
+mins <- difftime(ts[2], ts[1], units='mins')[[1]]
+flickersummlist <- list()
+for (i in 1:nrow(flicker)){
+    #create a datatime list for each row where value is 1
+    dtlist <- list()
+    for (dt in 1:ncol(flicker)){
+        if (flicker[i,dt] == 1){
+            dtlist <- c(dtlist, format(ts[dt])) #in this format can be added more info EST, CEST...
+        }
+    }
+    #create counter and modify dtlist
+    if(!length(dtlist)){counterlist = 0; dtlist=0} else {counterlist = length(dtlist)}
+    
+    
+    #create vector with values: id, dtlist and total hours
+    idsummary <- list(h['id'][[1]][i],
+                   counterlist*(mins/60),
+                   dtlist)
+    
+    #append results to flickersumm
+    flickersummlist[i] <- list(idsummary)
+
+}
+
+## Create a data frame based on list
+flickerdf = data.frame(matrix(vector(), nrow(flicker), 3,
+                              dimnames=list(c(), c("id", "flickhours", "dtlist"))),
+                       stringsAsFactors=F)
+for (e in 1:length(flickersummlist)){
+    flickerdf[e,] <- list(flickersummlist[[e]][[1]],
+                          flickersummlist[[e]][[2]],
+                          paste(flickersummlist[[e]][[3]], collapse = ' / '))
+}
+gc()
+
+#-------------------------------------------------------------------------------
+# CREATE SHADOW FLICKER MAP
+ShadowMAP <- sum(DEMmdif)
+ShadowMAPc <- rasterToContour(ShadowMAP)
+plot(ShadowMAP, add = TRUE)
+plot(ShadowMAPc, add = TRUE)
+#-------------------------------------------------------------------------------
+# OUTPUTS
+newfolder <- paste0(outdir,AAAAMMDD_HHmmss(),'_doshade','/')
+dir.create(newfolder, showWarnings = F)
+
+#-------------------------------------------------------------------------------
+# WRITE RASTERS
+if (exportRaster == TRUE){
+    DEM_folder <-paste0(newfolder,'DEM/')
+    DEMm_folder <- paste0(newfolder,'DEMm/')
+    DEMmdif_folder <- paste0(newfolder,'DEMmdif/')
+    dir.create(DEM_folder, showWarnings = F)
+    dir.create(DEMm_folder, showWarnings = F)
+    dir.create(DEMmdif_folder, showWarnings = F)
+    
+    # WRITE DEM objects
+    writeRaster(DEM,paste0(DEM_folder,'DEM'), format="GTiff", overwrite = TRUE)
+    writeRaster(DEMstack, paste0(DEM_folder,names(DEMstack)), bylayer=TRUE,format="GTiff") 
+    # writeRaster(DEMstack,paste0(DEM_folder,"DEM_doshade_stack.grd"), format="raster")
+    
+    # WRITE DEMm objects
+    writeRaster(DEMm,paste0(DEMm_folder,'DEMm'), format="GTiff", overwrite = TRUE)
+    writeRaster(DEMmstack, paste0(DEMm_folder,names(DEMmstack)), bylayer=TRUE,format="GTiff") 
+    # writeRaster(DEMmstack,paste0(DEMm_folder,"DEMm_doshade_stack.grd"), format="raster")
+    
+    # WRITE DEMmdif objects
+    writeRaster(DEMmdif, paste0(DEMmdif_folder,names(DEMmdif)), bylayer=TRUE,format="GTiff") 
+    # WRITE DEMmdif style
+    stylecopy <- paste(DEMmdif_folder,paste(names(DEMmdif),'.qml',sep=''),sep='/')
+    file.copy(from = doShadoStyle, to = stylecopy)
+    # writeRaster(DEMmdif,paste0(DEMmdif_folder,"DEMmdif_doshade_stack.grd"), format="raster") 
+}
+
+#-------------------------------------------------------------------------------
+# WRITE SUMMARY RESULTS
+write.xlsx(flickerdf, paste0(newfolder,"RESULTS.xlsx"))
+writeRaster(ShadowMAP, paste0(newfolder,"ShadowMAP"), format="GTiff", overwrite = TRUE)
+file.copy(from = ShadowMAPStyle, to = paste0(newfolder,'ShadowMAP.qml')) #write raster style
+writeOGR(ShadowMAPc, paste0(newfolder,"ShadowMAPc.gpkg"),"ShadowMAPc", driver="GPKG", overwrite = TRUE) #geopackage
+gc()
