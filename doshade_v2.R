@@ -15,7 +15,7 @@ outdir <- "./output/"
 doShadoStyle <- "./styles/doShadow_black.qml"
 ShadowMAPStyle <- "./styles/doShadow_ShadowMAP.qml"
 
-YYYY <- c(2019); MM <- c(1,6); DD <- c(1,15)
+YYYY <- c(2019); MM <- c(1:12); DD <- c(1:31)
 TZ <- "Europe/Berlin"
 by <- '60 min'
 
